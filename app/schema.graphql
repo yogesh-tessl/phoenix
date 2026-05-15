@@ -350,7 +350,7 @@ type BuiltInEvaluator implements Evaluator & Node {
   outputConfigs: [BuiltInEvaluatorOutputConfig!]!
 }
 
-union BuiltInEvaluatorOutputConfig = CategoricalAnnotationConfig | ContinuousAnnotationConfig
+union BuiltInEvaluatorOutputConfig = CategoricalAnnotationConfig | ContinuousAnnotationConfig | FreeformAnnotationConfig
 
 type CategoricalAnnotationConfig implements Node & AnnotationConfigBase {
   """The Globally Unique ID of this object"""
@@ -1570,6 +1570,8 @@ type ExperimentAnnotationSummary {
   meanScore: Float
   count: Int!
   errorCount: Int!
+  scoreCount: Int!
+  labelCount: Int!
 }
 
 type ExperimentComparison implements Node {
@@ -1887,11 +1889,15 @@ type FreeformAnnotationConfig implements Node & AnnotationConfigBase {
   name: String!
   description: String
   annotationType: AnnotationType!
+  optimizationDirection: OptimizationDirection!
+  threshold: Float
 }
 
 input FreeformAnnotationConfigInput {
   name: String!
   description: String = null
+  optimizationDirection: OptimizationDirection = null
+  threshold: Float = null
 }
 
 type FunctionCallChunk implements ChatCompletionSubscriptionPayload {

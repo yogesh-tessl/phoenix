@@ -1,5 +1,5 @@
 /**
- * @generated SignedSource<<f2bc5138c35e454fdab8aaab13fd1715>>
+ * @generated SignedSource<<678e0ed8d7843b2a8aacf9270d0559a0>>
  * @lightSyntaxTransform
  * @nogrep
  */
@@ -24,9 +24,11 @@ export type CodeDatasetEvaluatorDetails_datasetEvaluator$data = {
     readonly language?: Language;
     readonly name?: string;
     readonly outputConfigs?: ReadonlyArray<{
+      readonly freeformOptimizationDirection?: OptimizationDirection;
       readonly lowerBound?: number | null;
       readonly name?: string;
       readonly optimizationDirection?: OptimizationDirection;
+      readonly threshold?: number | null;
       readonly upperBound?: number | null;
       readonly values?: ReadonlyArray<{
         readonly label: string;
@@ -51,9 +53,11 @@ export type CodeDatasetEvaluatorDetails_datasetEvaluator$data = {
     readonly pathMapping: any;
   };
   readonly outputConfigs: ReadonlyArray<{
+    readonly freeformOptimizationDirection?: OptimizationDirection;
     readonly lowerBound?: number | null;
     readonly name?: string;
     readonly optimizationDirection?: OptimizationDirection;
+    readonly threshold?: number | null;
     readonly upperBound?: number | null;
     readonly values?: ReadonlyArray<{
       readonly label: string;
@@ -152,6 +156,28 @@ v3 = {
         }
       ],
       "type": "ContinuousAnnotationConfig",
+      "abstractKey": null
+    },
+    {
+      "kind": "InlineFragment",
+      "selections": [
+        (v1/*: any*/),
+        {
+          "alias": "freeformOptimizationDirection",
+          "args": null,
+          "kind": "ScalarField",
+          "name": "optimizationDirection",
+          "storageKey": null
+        },
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "threshold",
+          "storageKey": null
+        }
+      ],
+      "type": "FreeformAnnotationConfig",
       "abstractKey": null
     }
   ],
@@ -305,6 +331,6 @@ return {
 };
 })();
 
-(node as any).hash = "bb4bbd88be4773bb0ae55a8598ade320";
+(node as any).hash = "35500ec920e291d66a84de29ba4958a6";
 
 export default node;
