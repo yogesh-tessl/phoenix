@@ -34,8 +34,8 @@ import {
 
 type AddToolOutput = Chat<UIMessage>["addToolOutput"];
 
-type PhoenixToolCallProviderMetadata =
-  components["schemas"]["PhoenixToolCallProviderMetadata"];
+type ToolCallProviderMetadata =
+  components["schemas"]["ToolCallProviderMetadata"];
 
 /**
  * Minimal tool-call shape produced by the AI SDK runtime. `providerMetadata`
@@ -47,7 +47,7 @@ export type AgentToolCall = {
   toolName: string;
   input: unknown;
   providerMetadata?: {
-    phoenix?: PhoenixToolCallProviderMetadata;
+    phoenix?: ToolCallProviderMetadata;
   };
 };
 
