@@ -5,8 +5,8 @@ Covers all three modes:
 2. CategoricalOutputConfig — label validation + score lookup
 3. ContinuousOutputConfig — numeric extraction + bounds validation
 
-Also covers the D6 bool-exclusion rule throughout, triple-collapse dict
-acceptance, explanation passthrough, multi-output routing, and the new
+Also covers the bool-exclusion rule throughout, triple-collapse dict
+acceptance, explanation passthrough, multi-output routing, and the
 no-config rejection of arbitrary dicts/lists.
 """
 
@@ -292,7 +292,7 @@ class TestShapeExamples:
         config = _cat()
         examples = config.shape_examples(language="PYTHON", mode="full")
         assert not any("(" in ex and ")" in ex for ex in examples), (
-            "Tuples must not appear in shape_examples per D5 deferral"
+            "Tuples must not appear in shape_examples (tuple support is deferred)"
         )
 
     def test_categorical_shape_examples_typescript(self) -> None:
@@ -309,7 +309,7 @@ class TestShapeExamples:
         config = _cont(lower_bound=0.0, upper_bound=10.0)
         examples = config.shape_examples(language="PYTHON", mode="full")
         assert not any("(" in ex and ")" in ex for ex in examples), (
-            "Tuples must not appear in shape_examples per D5 deferral"
+            "Tuples must not appear in shape_examples (tuple support is deferred)"
         )
 
     def test_continuous_shape_examples_includes_bounds_hint(self) -> None:

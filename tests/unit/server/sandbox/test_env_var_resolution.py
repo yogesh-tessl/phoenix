@@ -1,6 +1,6 @@
 """Unit tests for env var resolution — reserved-name defense and helper contracts.
 
-Scope is the authored invariants only:
+Scope is limited to the rules this module enforces directly:
 - `_resolve_user_env` rejects reserved provider-credential names in both
   `secret_ref.secret_key` and `literal.name` positions, before any DB query.
 - `is_reserved_credential_name` helper contract.

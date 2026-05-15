@@ -691,7 +691,7 @@ test.describe.serial("Code Evaluators", () => {
   // config from the form is gone. Restore placeholder coverage if the
   // categorical authoring path is reintroduced.
 
-  // D6: Tab in the Python editor inserts four spaces, not a tab character.
+  // Tab in the Python editor inserts four spaces, not a tab character.
   test("Tab in Python code editor inserts four spaces", async ({ page }) => {
     await gotoDatasetEvaluators(page, datasetName);
 
@@ -722,7 +722,7 @@ test.describe.serial("Code Evaluators", () => {
     await expect(page.getByTestId("dialog")).not.toBeVisible();
   });
 
-  // D4: literal env_var values are redacted from the evaluator details page.
+  // Literal env_var values are redacted from the evaluator details page.
   // The only Python backend that's available in the bare test environment is
   // WASM, which does not advertise `supports_env_vars`. E2B/Daytona/Modal/
   // Vercel all advertise env vars but require provider credentials before
@@ -762,7 +762,7 @@ test.describe.serial("Code Evaluators", () => {
   });
 });
 
-// D5: env-var Name auto-populate behavior in the SandboxConfigDialog.
+// Env-var Name auto-populate behavior in the SandboxConfigDialog.
 // Independent from the eval/dataset fixtures above.
 test.describe
   .serial("Code Evaluators — sandbox env-var Name auto-populate", () => {

@@ -134,7 +134,7 @@ class CategoricalOutputConfig(CategoricalAnnotationConfig):
 
         mode='full'    — all valid shapes (bare label + dict-by-key)
         mode='curated' — same for categorical (bare + dict-with-explanation)
-        Tuples are NOT included per D5 deferral.
+        Tuples are NOT included (deferred).
         """
         example_label = self.values[0].label if self.values else "pass"
         # json.dumps wraps the label in double quotes and escapes ", \, and
@@ -155,7 +155,7 @@ class ContinuousOutputConfig(ContinuousAnnotationConfig):
 
         mode='full'    — all valid shapes (bare score + dict-by-key)
         mode='curated' — same for continuous (bare + dict-with-explanation)
-        Tuples are NOT included per D5 deferral.
+        Tuples are NOT included (deferred).
         """
         if self.lower_bound is not None and self.upper_bound is not None:
             example_score = (self.lower_bound + self.upper_bound) / 2

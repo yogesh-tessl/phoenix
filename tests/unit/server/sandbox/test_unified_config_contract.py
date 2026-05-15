@@ -10,12 +10,12 @@ metadata:
 - dependencies_language=None → build_backend(config={"dependencies": {"packages": ["x"]}})
                                raises UnsupportedOperation
 
-This is the structural conformance surface: every adapter in
-SANDBOX_ADAPTER_METADATA is exercised against the rejection contract for any
-capability it declares unsupported. Positive-path SDK forwarding is
-intentionally not covered here — it would re-verify library mock shapes
-rather than authored invariants. Real adapter drift surfaces in integration
-or deploy; targeted coverage is added then.
+This is the conformance surface: every adapter in SANDBOX_ADAPTER_METADATA
+is exercised against the rejection contract for any capability it declares
+unsupported. Positive-path SDK forwarding is intentionally not covered here
+— it would re-verify library mock shapes rather than behavior this module
+owns. Real adapter drift surfaces in integration or deploy; targeted
+coverage is added then.
 
 SDK mocking strategy:
 - Modal: sys.modules["modal"] must be patched before ModalSandboxBackend.__init__
