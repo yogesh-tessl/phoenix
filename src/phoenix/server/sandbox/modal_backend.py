@@ -29,11 +29,10 @@ Session lifecycle
   against the handle previously returned by ``find_or_create_session``.
 - close_session(): looks up the sandbox by name and terminates it; a missing
   name is treated as no-op (idempotent).
-- execute(): runs code in an ephemeral sandbox (create → exec → terminate)
-  when called without a manager-mediated session, or routes through
-  ``find_or_create_session`` + ``execute_in_session`` when a session_key is
-  supplied — preserving prior observable behavior for callers that hold
-  references to ``execute``.
+- execute(): runs code in an ephemeral sandbox (create → exec → terminate).
+  Manager-mediated session reuse lives on ``find_or_create_session`` +
+  ``execute_in_session``; ``execute`` is always single-shot regardless of
+  ``session_key``.
 - close(): no backend-local session state to release (binding lives in
   Modal's per-app name namespace).
 """
@@ -54,6 +53,7 @@ from .types import (
     SandboxAdapter,
     SandboxBackend,
     compose_secret_values,
+    compute_config_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -116,9 +116,20 @@ class ModalSandboxBackend(SandboxBackend):
         self._client: Optional[Client] = None
         self._app: Optional[App] = None
         self._client_lock = asyncio.Lock()
+        self._packages: list[str] = list(packages) if packages else []
         base_image = modal.Image.debian_slim()
-        self._image: Image = base_image.pip_install(list(packages)) if packages else base_image
+        self._image: Image = (
+            base_image.pip_install(self._packages) if self._packages else base_image
+        )
         self.secret_values = compose_secret_values(user_env, token_id, token_secret)
+
+    def config_fingerprint(self) -> str:
+        return compute_config_fingerprint(
+            family="MODAL",
+            packages=self._packages,
+            internet_access_mode="deny" if self._block_network else "allow",
+            env_var_keys=list(self._user_env.keys()),
+        )
 
     def provider_session_id(self, session_key: str) -> str:
         # Modal restricts sandbox names to alphanumeric + ``-`` and limits
@@ -277,14 +288,10 @@ class ModalSandboxBackend(SandboxBackend):
         session_key: str,
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
-        # Direct one-shot path (no manager mediation). When the caller supplies
-        # a session_key, route through the find_or_create_session path so
-        # repeated direct execute() calls with the same key reuse the remote
-        # sandbox; otherwise spin an ephemeral sandbox.
+        # Direct one-shot ephemeral execution: create, run, terminate.
+        # Manager-mediated session reuse lives on ``find_or_create_session`` /
+        # ``execute_in_session``; this path is always single-shot.
         try:
-            if session_key:
-                handle = await self.find_or_create_session(session_key)
-                return await self.execute_in_session(handle, code, timeout)
             sandbox = await self._create_sandbox()
             try:
                 return await self._exec_code(sandbox, code)

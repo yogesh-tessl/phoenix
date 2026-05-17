@@ -423,9 +423,7 @@ class ChatCompletionMutationMixin:
                     timeout=sandbox_timeout,
                     # Inline path: frontend generates a UUID at form-mount and
                     # sends it on every evaluatorPreviews call so the session
-                    # survives rename mid-iteration (Q3 key-churn fix). When
-                    # the field is unset the runner falls back to ``self._name``
-                    # so older clients keep working.
+                    # survives rename mid-iteration.
                     session_key=f"inline:{inline_code_evaluator.session_id}",
                     sandbox_session_manager=info.context.sandbox_session_manager,
                 )

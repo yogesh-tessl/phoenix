@@ -421,3 +421,71 @@ class TestE2BCrossWrapperConvergence:
         # ``object`` (opaque handle) by contract, so the test reaches through
         # to assert on the concrete e2b-shaped attribute.
         assert cast(Any, handle_a).sandbox_id == cast(Any, handle_b).sandbox_id
+
+
+def test_config_fingerprint_is_stable_and_changes_with_runtime_affecting_fields() -> None:
+    """Same config → same fingerprint; packages / internet_access / env-var
+    keys / template each fragment the fingerprint; secret plaintext rotation
+    under the same env-var keys does NOT."""
+
+    def _build(
+        *,
+        packages: list[str] | None = None,
+        allow_internet_access: bool = True,
+        user_env: dict[str, str] | None = None,
+        template: str | None = "base",
+    ) -> E2BSandboxBackend:
+        return E2BSandboxBackend(
+            api_key=_API_KEY,
+            template=template,
+            packages=packages,
+            allow_internet_access=allow_internet_access,
+            user_env=user_env,
+        )
+
+    base = _build(
+        packages=["numpy"],
+        allow_internet_access=True,
+        user_env={"FOO": "bar"},
+    )
+    assert (
+        base.config_fingerprint()
+        == _build(
+            packages=["numpy"],
+            allow_internet_access=True,
+            user_env={"FOO": "bar"},
+        ).config_fingerprint()
+    )
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["numpy", "pandas"],
+            allow_internet_access=True,
+            user_env={"FOO": "bar"},
+        ).config_fingerprint()
+    )
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["numpy"],
+            allow_internet_access=False,
+            user_env={"FOO": "bar"},
+        ).config_fingerprint()
+    )
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["numpy"],
+            allow_internet_access=True,
+            user_env={"FOO": "bar", "EXTRA": "x"},
+        ).config_fingerprint()
+    )
+    # Secret-value-only change must NOT change the fingerprint.
+    assert (
+        base.config_fingerprint()
+        == _build(
+            packages=["numpy"],
+            allow_internet_access=True,
+            user_env={"FOO": "ROTATED"},
+        ).config_fingerprint()
+    )

@@ -734,7 +734,7 @@ async def get_evaluators(
     session: AsyncSession,
     decrypt: Callable[[bytes], bytes],
     credentials: Sequence[GenerativeCredentialInput] | None = None,
-    sandbox_session_manager: Optional[SandboxSessionManager] = None,
+    sandbox_session_manager: SandboxSessionManager,
 ) -> list[BaseEvaluator]:
     """
     Get all evaluators for the given DatasetEvaluator row IDs.
@@ -2548,9 +2548,9 @@ class CodeEvaluatorRunner(BaseEvaluator):
         stored_output_configs: Sequence[OutputConfigType],
         sandbox_backend: "SandboxBackend",
         language: str,
+        sandbox_session_manager: SandboxSessionManager,
         timeout: Optional[int] = None,
         session_key: Optional[str] = None,
-        sandbox_session_manager: Optional[SandboxSessionManager] = None,
     ) -> None:
         self._name = name
         self._description = description
@@ -2560,12 +2560,9 @@ class CodeEvaluatorRunner(BaseEvaluator):
         self._language = language.upper()
         self._timeout = timeout
         # Optional override for the backend session key. When None, the runner
-        # falls back to ``self._name`` (preserves backward-compat for stored
-        # and dataset paths whose names are DB-stable).
+        # falls back to ``self._name`` (used by stored and dataset paths whose
+        # names are DB-stable).
         self._session_key_override = session_key
-        # Optional manager-mediated execution. When None, the runner calls the
-        # backend directly (preserves legacy callers and tests not yet plumbed
-        # through the manager).
         self._sandbox_session_manager = sandbox_session_manager
 
     @property
@@ -2784,27 +2781,15 @@ class CodeEvaluatorRunner(BaseEvaluator):
                 set_status_on_exception=False,
             ) as sandbox_span:
                 try:
-                    if self._sandbox_session_manager is not None:
-                        # Manager-mediated: ref-counted acquire/release wraps
-                        # the backend execute. The asyncio.wait_for stays
-                        # OUTSIDE acquire so cancellation flows through the
-                        # manager's release-on-cancellation path.
-                        async with self._sandbox_session_manager.acquire(
-                            self._sandbox_backend, session_key
-                        ) as session:
-                            execution = await asyncio.wait_for(
-                                session.execute(code, timeout=self._timeout),
-                                timeout=self._timeout,
-                            )
-                    else:
-                        # Back-compat path for callers / tests not yet plumbed
-                        # through the manager.
+                    # Manager-mediated: ref-counted acquire/release wraps
+                    # the backend execute. The asyncio.wait_for stays
+                    # OUTSIDE acquire so cancellation flows through the
+                    # manager's release-on-cancellation path.
+                    async with self._sandbox_session_manager.acquire(
+                        self._sandbox_backend, session_key
+                    ) as session:
                         execution = await asyncio.wait_for(
-                            self._sandbox_backend.execute(
-                                code,
-                                session_key=session_key,
-                                timeout=self._timeout,
-                            ),
+                            session.execute(code, timeout=self._timeout),
                             timeout=self._timeout,
                         )
                 except SessionLimitExceeded as exc:
@@ -2840,25 +2825,7 @@ class CodeEvaluatorRunner(BaseEvaluator):
                     # discarded ``asyncio.create_task``) hands the task to
                     # the manager so it is awaited at shutdown instead of
                     # being cancelled mid-flight.
-                    if self._sandbox_session_manager is not None:
-                        self._sandbox_session_manager.schedule_eviction(session_key)
-                    else:
-                        # Back-compat path for direct-backend callers (no
-                        # manager plumbed). Fire-and-forget ``close_session``
-                        # so the backend sandbox is released; otherwise it
-                        # leaks until idle TTL. Best-effort: swallow close
-                        # failures and log a warning so the timeout result
-                        # still flows back to the caller.
-                        async def _close_session_quietly() -> None:
-                            try:
-                                await self._sandbox_backend.close_session(session_key)
-                            except Exception as close_exc:
-                                logger.warning(
-                                    "close_session failed during timeout teardown: %s",
-                                    close_exc,
-                                )
-
-                        asyncio.create_task(_close_session_quietly())
+                    self._sandbox_session_manager.schedule_eviction(session_key)
                     execution = ExecutionResult(stdout="", stderr="", error="timeout")
                     _record_masked_exception(sandbox_span, exc, masker)
                     sandbox_span.set_status(Status(StatusCode.ERROR, "timeout"))

@@ -107,6 +107,12 @@ class _FakeBackend(SandboxBackend):
     def __init__(self) -> None:
         self.secret_values = frozenset()
 
+    def config_fingerprint(self) -> str:
+        # Stable across fresh wrappers because the fake config carries no
+        # runtime-affecting fields; the manager composes this into
+        # f"{session_key}#{fingerprint}" for its internal keying.
+        return "fake"
+
     async def find_or_create_session(self, session_key: str) -> object:
         _FAKE_FIND_CALLS.append((id(self), session_key))
         handle = _FAKE_PROVIDER_SESSIONS.get(session_key)
@@ -254,7 +260,11 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
         cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
         cfg_gid = _config_global_id(cfg_id)
         session_id = "stable-session-uuid-1111"
-        composed_key = f"inline:{session_id}"
+        # Mirrors SandboxSessionManager._composite_key — the manager appends
+        # the backend's config_fingerprint to the logical session_key for its
+        # internal _tracked map and propagates the composite to
+        # find_or_create_session / close_session.
+        composed_key = f"inline:{session_id}#fake"
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
             first = await gql_client.execute(
@@ -322,7 +332,11 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
         cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
         cfg_gid = _config_global_id(cfg_id)
         session_id = "stable-session-uuid-2222"
-        composed_key = f"inline:{session_id}"
+        # Mirrors SandboxSessionManager._composite_key — the manager appends
+        # the backend's config_fingerprint to the logical session_key for its
+        # internal _tracked map and propagates the composite to
+        # find_or_create_session / close_session.
+        composed_key = f"inline:{session_id}#fake"
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
             first = await gql_client.execute(
@@ -373,7 +387,11 @@ class TestStopEvaluatorSessionEvictsByComposedKey:
         cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
         cfg_gid = _config_global_id(cfg_id)
         session_id = "session-to-evict-3333"
-        composed_key = f"inline:{session_id}"
+        # Mirrors SandboxSessionManager._composite_key — the manager appends
+        # the backend's config_fingerprint to the logical session_key for its
+        # internal _tracked map and propagates the composite to
+        # find_or_create_session / close_session.
+        composed_key = f"inline:{session_id}#fake"
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
             preview = await gql_client.execute(
@@ -438,8 +456,8 @@ class TestStopEvaluatorSessionEvictsByComposedKey:
         cfg_gid = _config_global_id(cfg_id)
         session_id_a = "session-keep-A"
         session_id_b = "session-evict-B"
-        composed_a = f"inline:{session_id_a}"
-        composed_b = f"inline:{session_id_b}"
+        composed_a = f"inline:{session_id_a}#fake"
+        composed_b = f"inline:{session_id_b}#fake"
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
             for sid in (session_id_a, session_id_b):
@@ -469,39 +487,3 @@ class TestStopEvaluatorSessionEvictsByComposedKey:
         assert evicted_keys == [composed_b]
         assert composed_a in _FAKE_PROVIDER_SESSIONS
         assert composed_b not in _FAKE_PROVIDER_SESSIONS
-
-
-class TestEvaluatorPreviewsBackwardCompat:
-    """The optional ``sessionId`` keeps the inline path working without it
-    (falling back to ``self._name`` on the runner side).
-    """
-
-    async def test_evaluator_previews_without_session_id_falls_back_to_name(
-        self,
-        db: DbSessionFactory,
-        gql_client: AsyncGraphQLClient,
-    ) -> None:
-        _reset_fake_provider_state()
-        backend_type = "SESSION_REUSE_FAKE_E"
-        adapter = _FakeAdapter(backend_type=backend_type)
-        cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
-        cfg_gid = _config_global_id(cfg_id)
-
-        with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
-            result = await gql_client.execute(
-                _EVALUATOR_PREVIEWS,
-                variables={
-                    "input": _inline_code_evaluator_input(
-                        name="fallback_eval",
-                        sandbox_config_gid=cfg_gid,
-                        session_id=None,
-                    )
-                },
-            )
-            assert result.data and not result.errors, result.errors
-
-        # Without a stable sessionId the inline caller passes
-        # ``inline:None`` (or whatever the runner composes); the precise
-        # key shape is not load-bearing for this test — what matters is
-        # that the request completed end-to-end with exactly one find call.
-        assert len(_FAKE_FIND_CALLS) == 1

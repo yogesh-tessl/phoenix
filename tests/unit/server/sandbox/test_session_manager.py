@@ -31,6 +31,19 @@ from phoenix.server.sandbox.types import (
 )
 
 
+def _ck(session_key: str, fingerprint: str = "fp") -> str:
+    """Compose the manager-internal composite key the way ``acquire`` does.
+
+    Mirrors ``SandboxSessionManager._composite_key`` so tests can assert on
+    the ``_tracked`` / ``_key_locks`` entries and the values
+    ``backend.find_or_create_session`` / ``backend.close_session`` receive
+    without re-deriving the format. The default ``fingerprint`` matches
+    ``_FakeBackend._fingerprint`` so tests using the default fake don't have
+    to thread the fingerprint through.
+    """
+    return f"{session_key}#{fingerprint}"
+
+
 class _FakeHandle:
     """Opaque per-key remote handle the fake backend hands back."""
 
@@ -50,11 +63,19 @@ class _FakeBackend(SandboxBackend):
     # the manager reads via ``getattr(backend, "family", type(...).__name__)``.
     family: str = "FAKE"
 
+    # Constant fingerprint by default so the manager's composite key is
+    # deterministic in tests that don't exercise config-switch behavior.
+    # Tests covering config-switch override this on the instance.
+    _fingerprint: str = "fp"
+
     def __init__(self) -> None:
         self.find_calls: list[str] = []
         self.close_calls: list[str] = []
         self.execute_in_session_calls: list[tuple[str, str, Optional[int]]] = []
         self._sessions: dict[str, _FakeHandle] = {}
+
+    def config_fingerprint(self) -> str:
+        return self._fingerprint
 
     async def find_or_create_session(self, session_key: str) -> object:
         self.find_calls.append(session_key)
@@ -140,12 +161,12 @@ async def test_acquire_invokes_find_or_create_session_once_per_key() -> None:
     async with manager.acquire(backend, "k1") as session:
         await session.execute("print(2)")
 
-    assert backend.find_calls == ["k1"], (
+    assert backend.find_calls == [_ck("k1")], (
         f"find_or_create_session must run once for k1; got {backend.find_calls!r}"
     )
     assert len(backend.execute_in_session_calls) == 2
-    # Both executes routed through the same handle bound to k1.
-    assert all(call[0] == "k1" for call in backend.execute_in_session_calls)
+    # Both executes routed through the same handle bound to k1's composite.
+    assert all(call[0] == _ck("k1") for call in backend.execute_in_session_calls)
 
 
 @pytest.mark.asyncio
@@ -171,7 +192,7 @@ async def test_idle_ttl_evicts_via_close_session(sweep_trigger: Event) -> None:
     finally:
         await manager.stop()
 
-    assert backend.close_calls == ["k1"], (
+    assert backend.close_calls == [_ck("k1")], (
         f"sweeper must close idle session; got close_calls={backend.close_calls}"
     )
 
@@ -215,7 +236,7 @@ async def test_acquire_raises_session_limit_exceeded() -> None:
             async with manager.acquire(backend, "k1") as session:
                 await session.execute("print('still works')")
 
-    assert sorted(backend.find_calls) == ["k1", "k2"]
+    assert sorted(backend.find_calls) == [_ck("k1"), _ck("k2")]
 
 
 @pytest.mark.asyncio
@@ -244,9 +265,9 @@ async def test_capacity_is_per_provider_family() -> None:
         async with manager.acquire(backend_b, "b1") as session:
             await session.execute("ok")
 
-    assert backend_a1.find_calls == ["a1"]
+    assert backend_a1.find_calls == [_ck("a1")]
     assert backend_a2.find_calls == []
-    assert backend_b.find_calls == ["b1"]
+    assert backend_b.find_calls == [_ck("b1")]
 
 
 @pytest.mark.asyncio
@@ -264,7 +285,7 @@ async def test_concurrent_acquires_respect_capacity_under_race() -> None:
 
         async def find_or_create_session(self, session_key: str) -> object:
             self.find_calls.append(session_key)
-            if session_key == "a":
+            if session_key.startswith("a#"):
                 a_in_find.set()
                 await release_a.wait()
             return _FakeHandle(session_key)
@@ -291,6 +312,9 @@ async def test_concurrent_acquires_respect_capacity_under_race() -> None:
         async def close(self) -> None:
             pass
 
+        def config_fingerprint(self) -> str:
+            return "gated"
+
     backend = _GatedBackend()
     manager = SandboxSessionManager(max_sessions_per_provider=1)
 
@@ -313,7 +337,7 @@ async def test_concurrent_acquires_respect_capacity_under_race() -> None:
     assert result_a == "acquired"
     assert result_b == "rejected"
     # find_or_create_session must never run for "b".
-    assert backend.find_calls == ["a"]
+    assert backend.find_calls == [_ck("a", "gated")]
 
 
 @pytest.mark.asyncio
@@ -327,6 +351,9 @@ async def test_find_or_create_session_failure_releases_reservation() -> None:
         def __init__(self) -> None:
             self.find_calls: list[str] = []
             self.fail_next = True
+
+        def config_fingerprint(self) -> str:
+            return "fail"
 
         async def find_or_create_session(self, session_key: str) -> object:
             self.find_calls.append(session_key)
@@ -371,7 +398,7 @@ async def test_find_or_create_session_failure_releases_reservation() -> None:
     async with manager.acquire(backend, "k1") as session:
         result = await session.execute("print('ok')")
     assert result.stdout == "print('ok')"
-    assert backend.find_calls == ["k1", "k1"]
+    assert backend.find_calls == [_ck("k1", "fail"), _ck("k1", "fail")]
 
 
 @pytest.mark.asyncio
@@ -406,18 +433,18 @@ async def test_release_after_lock_pop_still_decrements_inflight() -> None:
     async with manager.acquire(backend, "k1"):
         pass
 
-    captured_lock = manager._key_locks["k1"]
+    captured_lock = manager._key_locks[_ck("k1")]
 
     await manager.evict_for_session_key("k1")
-    assert "k1" not in manager._key_locks
-    assert "k1" not in manager._tracked
-    assert backend.close_calls == ["k1"]
+    assert _ck("k1") not in manager._key_locks
+    assert _ck("k1") not in manager._tracked
+    assert backend.close_calls == [_ck("k1")]
 
     async with manager.acquire(backend, "k1"):
-        assert manager._key_locks["k1"] is not captured_lock
-        tracked = manager._tracked["k1"]
+        assert manager._key_locks[_ck("k1")] is not captured_lock
+        tracked = manager._tracked[_ck("k1")]
         assert tracked.in_flight_count == 1
-    assert manager._tracked["k1"].in_flight_count == 0
+    assert manager._tracked[_ck("k1")].in_flight_count == 0
 
 
 @pytest.mark.asyncio
@@ -437,9 +464,12 @@ async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_fin
             self.find_calls: list[str] = []
             self.close_calls: list[str] = []
 
+        def config_fingerprint(self) -> str:
+            return "gp"
+
         async def find_or_create_session(self, session_key: str) -> object:
             self.find_calls.append(session_key)
-            if session_key == "k1" and len(self.find_calls) >= 2:
+            if session_key.startswith("k1#") and len(self.find_calls) >= 2:
                 leader_in_find.set()
                 await start_gate.wait()
             return _FakeHandle(session_key)
@@ -472,8 +502,8 @@ async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_fin
     async with manager.acquire(backend, "k1"):
         pass
     await manager.evict_for_session_key("k1")
-    assert "k1" not in manager._key_locks
-    assert "k1" not in manager._tracked
+    assert _ck("k1", "gp") not in manager._key_locks
+    assert _ck("k1", "gp") not in manager._tracked
 
     async def y_acquire() -> str:
         async with manager.acquire(backend, "k1"):
@@ -501,7 +531,7 @@ async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_fin
     assert result_y == "y-acquired"
     assert result_z == "z-acquired"
 
-    assert backend.find_calls.count("k1") == 2, (
+    assert backend.find_calls.count(_ck("k1", "gp")) == 2, (
         f"find_or_create_session must run once for X and once for Y, never for Z; "
         f"got find_calls={backend.find_calls}"
     )
@@ -573,7 +603,7 @@ async def test_acquire_raises_session_invalidated_when_marked_for_eviction() -> 
     release_leader.set()
     await leader
 
-    assert backend.find_calls == ["k1"]
+    assert backend.find_calls == [_ck("k1")]
 
 
 @pytest.mark.asyncio
@@ -599,8 +629,8 @@ async def test_manager_stop_drains_tracked_via_close_session() -> None:
     finally:
         await manager.stop()
 
-    assert sorted(backend_a.close_calls) == ["ka1", "ka2"]
-    assert backend_b.close_calls == ["kb1"]
+    assert sorted(backend_a.close_calls) == [_ck("ka1"), _ck("ka2")]
+    assert backend_b.close_calls == [_ck("kb1")]
     assert manager._tasks == []
 
 
@@ -618,6 +648,9 @@ async def test_manager_stop_awaits_pending_tasks_before_cancelling_sweeper() -> 
         def __init__(self) -> None:
             self.find_calls: list[str] = []
             self.close_calls: list[str] = []
+
+        def config_fingerprint(self) -> str:
+            return "sc"
 
         async def find_or_create_session(self, session_key: str) -> object:
             self.find_calls.append(session_key)
@@ -672,7 +705,91 @@ async def test_manager_stop_awaits_pending_tasks_before_cancelling_sweeper() -> 
     release_close.set()
     await stop_task
 
-    assert backend.close_calls == ["k1"]
+    assert backend.close_calls == [_ck("k1", "sc")]
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_does_not_cancel_slow_pending_eviction_past_grace() -> None:
+    """A pending ``schedule_eviction`` task whose ``close_session`` runs
+    longer than ``eviction_grace_seconds`` must NOT be cancelled by
+    ``stop()`` — it must run to completion after ``stop()`` returns."""
+    grace = 0.05
+    close_entered = asyncio.Event()
+    cancelled_during_close = False
+
+    class _SlowCloseBackend(SandboxBackend):
+        family = "SLOW_CLOSE_PAST_GRACE"
+
+        def __init__(self) -> None:
+            self.find_calls: list[str] = []
+            self.close_calls: list[str] = []
+
+        def config_fingerprint(self) -> str:
+            return "scpg"
+
+        async def find_or_create_session(self, session_key: str) -> object:
+            self.find_calls.append(session_key)
+            return _FakeHandle(session_key)
+
+        async def execute_in_session(
+            self,
+            handle: object,
+            code: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout="", stderr="")
+
+        async def close_session(self, session_key: str) -> None:
+            nonlocal cancelled_during_close
+            close_entered.set()
+            try:
+                await asyncio.sleep(grace * 2)
+            except asyncio.CancelledError:
+                cancelled_during_close = True
+                raise
+            self.close_calls.append(session_key)
+
+        async def execute(
+            self,
+            code: str,
+            session_key: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout="", stderr="")
+
+        async def close(self) -> None:
+            pass
+
+    backend = _SlowCloseBackend()
+    manager = SandboxSessionManager(
+        idle_ttl_seconds=60.0,
+        sweep_interval_seconds=60.0,
+        eviction_grace_seconds=grace,
+    )
+
+    await manager.start()
+    async with manager.acquire(backend, "k1"):
+        pass
+
+    manager.schedule_eviction("k1")
+    await close_entered.wait()
+    assert manager._pending_tasks is not None
+    pending_task = next(iter(manager._pending_tasks))
+
+    await manager.stop()
+
+    # stop() must have returned without cancelling the slow close_session.
+    assert not pending_task.done(), (
+        "slow pending eviction should still be running after stop() returns"
+    )
+    assert not cancelled_during_close
+    assert backend.close_calls == []
+
+    # The pending task is allowed to finish on its own; provider TTLs would
+    # otherwise reap the orphan in production.
+    await asyncio.wait_for(pending_task, timeout=grace * 10)
+    assert backend.close_calls == [_ck("k1", "scpg")]
+    assert not cancelled_during_close
 
 
 @pytest.mark.asyncio
@@ -712,7 +829,7 @@ async def test_evict_drain_poll_identity_check_rejects_fresh_same_key_entry() ->
     await asyncio.wait_for(evict_task, timeout=2.0)
 
     assert result.stdout == "print('post-evict')"
-    assert backend.close_calls == ["k1"]
+    assert backend.close_calls == [_ck("k1")]
 
 
 @pytest.mark.asyncio
@@ -740,10 +857,10 @@ async def test_evict_for_provider_family_targets_only_matching_family() -> None:
 
     await manager.evict_for_provider_family("MODAL")
 
-    assert sorted(modal_a.close_calls) == ["m1"]
-    assert sorted(modal_b.close_calls) == ["m2"]
+    assert sorted(modal_a.close_calls) == [_ck("m1")]
+    assert sorted(modal_b.close_calls) == [_ck("m2")]
     assert e2b.close_calls == []
-    assert "e1" in manager._tracked
+    assert _ck("e1") in manager._tracked
 
 
 @pytest.mark.asyncio
@@ -758,7 +875,83 @@ async def test_execute_routes_through_execute_in_session_with_bound_handle() -> 
         await session.execute("print(2)")
 
     # Both executes ran via execute_in_session against the same handle.
-    assert [c[0] for c in backend.execute_in_session_calls] == ["k1", "k1"]
+    assert [c[0] for c in backend.execute_in_session_calls] == [_ck("k1"), _ck("k1")]
     assert [c[1] for c in backend.execute_in_session_calls] == ["print(1)", "print(2)"]
     assert backend.execute_in_session_calls[0][2] == 42
     assert backend.execute_in_session_calls[1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_config_switch_under_same_logical_key_produces_distinct_tracked_entries() -> None:
+    """A mid-iteration config change under a stable frontend ``session_key``
+    must produce a fresh session at both the manager and the provider layer.
+
+    Two ``acquire`` calls for the same logical key, against two backends
+    whose ``config_fingerprint`` differs, must:
+      - allocate two distinct ``_tracked`` entries (keyed on the composite
+        ``f"{session_key}#{fingerprint}"`` per backend),
+      - call ``find_or_create_session`` once per composite (so the provider
+        sees the fingerprint and can fragment its label / list-by-key
+        convergence along the same boundary),
+      - leave ``acquire(backend, session_key)`` itself unchanged at the
+        call site — the caller still passes the logical key.
+    """
+
+    class _BackendOldConfig(_FakeBackend):
+        _fingerprint = "old-cfg"
+
+    class _BackendNewConfig(_FakeBackend):
+        _fingerprint = "new-cfg"
+
+    manager = SandboxSessionManager(max_sessions_per_provider=8)
+    backend_old = _BackendOldConfig()
+    backend_new = _BackendNewConfig()
+
+    async with manager.acquire(backend_old, "frontend-session"):
+        pass
+    async with manager.acquire(backend_new, "frontend-session"):
+        pass
+
+    # Distinct tracked entries under the same logical key.
+    assert _ck("frontend-session", "old-cfg") in manager._tracked
+    assert _ck("frontend-session", "new-cfg") in manager._tracked
+    assert len(manager._tracked) == 2
+
+    # Each backend saw exactly one find_or_create_session with ITS composite.
+    assert backend_old.find_calls == [_ck("frontend-session", "old-cfg")]
+    assert backend_new.find_calls == [_ck("frontend-session", "new-cfg")]
+
+
+@pytest.mark.asyncio
+async def test_evict_for_session_key_drains_every_composite_under_logical_key() -> None:
+    """``evict_for_session_key("k")`` evicts every tracked entry whose
+    composite key prefix matches ``"k#"``, so a single logical-key eviction
+    drains all config-variants under that key.
+
+    This matches the documented ``stopEvaluatorSession`` contract: the
+    frontend passes a logical session id and expects every backend session
+    bound to it to stop, regardless of mid-iteration config drift.
+    """
+
+    class _BackendCfgA(_FakeBackend):
+        _fingerprint = "cfg-a"
+
+    class _BackendCfgB(_FakeBackend):
+        _fingerprint = "cfg-b"
+
+    manager = SandboxSessionManager(max_sessions_per_provider=8)
+    backend_a = _BackendCfgA()
+    backend_b = _BackendCfgB()
+
+    async with manager.acquire(backend_a, "logical-k"):
+        pass
+    async with manager.acquire(backend_b, "logical-k"):
+        pass
+    assert len(manager._tracked) == 2
+
+    await manager.evict_for_session_key("logical-k")
+
+    assert manager._tracked == {}
+    # Each variant's close_session ran exactly once with its own composite.
+    assert backend_a.close_calls == [_ck("logical-k", "cfg-a")]
+    assert backend_b.close_calls == [_ck("logical-k", "cfg-b")]

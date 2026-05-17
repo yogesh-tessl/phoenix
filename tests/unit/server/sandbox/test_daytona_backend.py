@@ -443,6 +443,81 @@ class TestFindOrCreateSessionConvergence:
         assert cast(Any, handle_a).id == cast(Any, handle_b).id
 
 
+class TestPostCreateDedup:
+    """Two concurrent creates against the same ``session_key`` converge on one
+    surviving sandbox via ``_dedupe_after_create`` re-list-and-kill."""
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_creates_converge_on_one_survivor(self) -> None:
+        daytona_mod, process_mod = _make_daytona_mocks()
+        client = daytona_mod.AsyncDaytona.return_value
+
+        # Two sandboxes for the same session_key — simulates the race
+        # window where both replicas listed empty and then both created.
+        sb_a = MagicMock(id="sb-aaa", state="STARTED")
+        sb_a.process.code_run = AsyncMock(return_value=MagicMock(result="ok", exit_code=0))
+        sb_b = MagicMock(id="sb-bbb", state="STARTED")
+        sb_b.process.code_run = AsyncMock(return_value=MagicMock(result="ok", exit_code=0))
+
+        # Initial list returns empty (the race premise); the post-create
+        # re-list returns both sandboxes so dedup picks the oldest by id.
+        empty_resp = MagicMock()
+        empty_resp.items = []
+        both_resp = MagicMock()
+        both_resp.items = [sb_b, sb_a]  # intentionally out of id order
+        client.list = AsyncMock(side_effect=[empty_resp, both_resp])
+        client.create = AsyncMock(return_value=sb_b)  # we "lost" the race
+        client.delete = AsyncMock()
+
+        modules = {
+            "daytona_sdk": daytona_mod,
+            "daytona_sdk.common": MagicMock(),
+            "daytona_sdk.common.process": process_mod,
+        }
+        with patch.dict(sys.modules, modules), _patch_sandbox_state(daytona_mod):
+            from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+            backend = DaytonaSandboxBackend(api_key=_API_KEY)
+            handle = await backend.find_or_create_session("ev:race")
+
+        # Survivor is sb_a (lower id); the just-created sb_b is the loser
+        # and gets deleted.
+        assert cast(Any, handle).id == "sb-aaa"
+        client.delete.assert_awaited_once_with(sb_b)
+
+    @pytest.mark.asyncio
+    async def test_single_candidate_returns_just_created_without_delete(self) -> None:
+        """Single-replica steady state: re-list returns one candidate, dedup
+        short-circuits, no delete is issued."""
+        daytona_mod, process_mod = _make_daytona_mocks()
+        client = daytona_mod.AsyncDaytona.return_value
+
+        sb_new = MagicMock(id="sb-new", state="STARTED")
+        sb_new.process.code_run = AsyncMock(return_value=MagicMock(result="ok", exit_code=0))
+
+        empty_resp = MagicMock()
+        empty_resp.items = []
+        single_resp = MagicMock()
+        single_resp.items = [sb_new]
+        client.list = AsyncMock(side_effect=[empty_resp, single_resp])
+        client.create = AsyncMock(return_value=sb_new)
+        client.delete = AsyncMock()
+
+        modules = {
+            "daytona_sdk": daytona_mod,
+            "daytona_sdk.common": MagicMock(),
+            "daytona_sdk.common.process": process_mod,
+        }
+        with patch.dict(sys.modules, modules), _patch_sandbox_state(daytona_mod):
+            from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+            backend = DaytonaSandboxBackend(api_key=_API_KEY)
+            handle = await backend.find_or_create_session("ev:solo")
+
+        assert cast(Any, handle).id == "sb-new"
+        client.delete.assert_not_awaited()
+
+
 class TestCloseSession:
     @pytest.mark.asyncio
     async def test_close_session_deletes_all_matches(self) -> None:
@@ -482,3 +557,94 @@ def test_provider_session_id_default_is_passthrough() -> None:
         backend = DaytonaSandboxBackend(api_key=_API_KEY)
         for key in ("evaluator:42", "inline:abc-123", "x" * 200):
             assert backend.provider_session_id(key) == key
+
+
+def test_config_fingerprint_is_stable_and_changes_with_runtime_affecting_fields() -> None:
+    """Same config → same fingerprint; packages / network_block_all /
+    env-var keys / language each fragment the fingerprint; secret plaintext
+    rotation under the same env-var keys does NOT."""
+    daytona_mod, process_mod = _make_daytona_mocks()
+    modules = {
+        "daytona_sdk": daytona_mod,
+        "daytona_sdk.common": MagicMock(),
+        "daytona_sdk.common.process": process_mod,
+    }
+    with patch.dict(sys.modules, modules):
+        from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+        def _build(
+            *,
+            packages: list[str] | None = None,
+            network_block_all: bool = False,
+            user_env: dict[str, str] | None = None,
+            language: str = "PYTHON",
+        ) -> DaytonaSandboxBackend:
+            return DaytonaSandboxBackend(
+                api_key=_API_KEY,
+                packages=packages,
+                network_block_all=network_block_all,
+                user_env=user_env,
+                language=language,
+            )
+
+        base = _build(
+            packages=["numpy==1.26"],
+            network_block_all=False,
+            user_env={"FOO": "bar"},
+            language="PYTHON",
+        )
+        assert (
+            base.config_fingerprint()
+            == _build(
+                packages=["numpy==1.26"],
+                network_block_all=False,
+                user_env={"FOO": "bar"},
+                language="PYTHON",
+            ).config_fingerprint()
+        )
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26", "pandas"],
+                network_block_all=False,
+                user_env={"FOO": "bar"},
+                language="PYTHON",
+            ).config_fingerprint()
+        )
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26"],
+                network_block_all=True,
+                user_env={"FOO": "bar"},
+                language="PYTHON",
+            ).config_fingerprint()
+        )
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26"],
+                network_block_all=False,
+                user_env={"FOO": "bar", "EXTRA": "x"},
+                language="PYTHON",
+            ).config_fingerprint()
+        )
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26"],
+                network_block_all=False,
+                user_env={"FOO": "bar"},
+                language="TYPESCRIPT",
+            ).config_fingerprint()
+        )
+        # Secret-value-only change must NOT change the fingerprint.
+        assert (
+            base.config_fingerprint()
+            == _build(
+                packages=["numpy==1.26"],
+                network_block_all=False,
+                user_env={"FOO": "ROTATED"},
+                language="PYTHON",
+            ).config_fingerprint()
+        )

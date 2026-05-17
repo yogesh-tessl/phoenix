@@ -423,3 +423,85 @@ async def test_close_session_is_idempotent_on_unknown_name() -> None:
         backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
         # Must NOT raise.
         await backend.close_session("evaluator:never-bound")
+
+
+def test_config_fingerprint_is_stable_and_changes_with_runtime_affecting_fields() -> None:
+    """``config_fingerprint`` is the manager-side disambiguator for
+    mid-iteration config switches.
+
+    Contract:
+      - Structurally-equal configs produce the same fingerprint.
+      - Changing the package list, internet-access mode, or env-var key set
+        changes the fingerprint.
+      - Rotating a secret's plaintext value WITHOUT changing the env-var
+        key set leaves the fingerprint unchanged — masking handles
+        plaintext rotation; the fingerprint must survive credential
+        rotation so sessions don't churn whenever a secret rotates.
+    """
+    modal_mock = _make_modal_mock()
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        def _build(
+            *,
+            packages: list[str] | None = None,
+            block_network: bool = False,
+            user_env: Mapping[str, str] | None = None,
+        ) -> ModalSandboxBackend:
+            return ModalSandboxBackend(
+                token_id=_TOKEN_ID,
+                token_secret=_TOKEN_SECRET,
+                packages=packages,
+                block_network=block_network,
+                user_env=user_env,
+            )
+
+        base = _build(
+            packages=["numpy==1.26.0"],
+            block_network=False,
+            user_env={"FOO": "bar"},
+        )
+        equal_shape = _build(
+            packages=["numpy==1.26.0"],
+            block_network=False,
+            user_env={"FOO": "bar"},
+        )
+        assert base.config_fingerprint() == equal_shape.config_fingerprint()
+
+        # Packages list change.
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26.0", "requests"],
+                block_network=False,
+                user_env={"FOO": "bar"},
+            ).config_fingerprint()
+        )
+
+        # Internet-access mode change.
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26.0"],
+                block_network=True,
+                user_env={"FOO": "bar"},
+            ).config_fingerprint()
+        )
+
+        # env_vars KEYS change.
+        assert (
+            base.config_fingerprint()
+            != _build(
+                packages=["numpy==1.26.0"],
+                block_network=False,
+                user_env={"FOO": "bar", "EXTRA": "x"},
+            ).config_fingerprint()
+        )
+
+        # Secret-plaintext-only change (same key) — fingerprint must NOT change.
+        rotated = _build(
+            packages=["numpy==1.26.0"],
+            block_network=False,
+            user_env={"FOO": "ROTATED_VALUE"},
+        )
+        assert rotated.config_fingerprint() == base.config_fingerprint()

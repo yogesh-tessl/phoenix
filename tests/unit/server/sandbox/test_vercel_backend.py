@@ -503,3 +503,90 @@ def test_provider_session_id_default_is_passthrough() -> None:
     )
     for key in ("evaluator:42", "inline:abc-123", "x" * 200):
         assert backend.provider_session_id(key) == key
+
+
+def test_config_fingerprint_is_stable_and_changes_with_runtime_affecting_fields() -> None:
+    """Same config → same fingerprint; packages / internet_access / env-var
+    keys / language each fragment the fingerprint; secret plaintext rotation
+    under the same env-var keys does NOT."""
+
+    def _build(
+        *,
+        language: str = "PYTHON",
+        packages: list[str] | None = None,
+        internet_access: bool | None = True,
+        user_env: dict[str, str] | None = None,
+    ) -> VercelSandboxBackend:
+        return VercelSandboxBackend(
+            token=_TOKEN,
+            project_id=_PROJECT,
+            team_id=_TEAM,
+            language=language,
+            packages=packages,
+            internet_access=internet_access,
+            user_env=user_env,
+        )
+
+    base = _build(
+        packages=["lodash@^4.17"],
+        internet_access=True,
+        user_env={"FOO": "bar"},
+        language="TYPESCRIPT",
+    )
+    assert (
+        base.config_fingerprint()
+        == _build(
+            packages=["lodash@^4.17"],
+            internet_access=True,
+            user_env={"FOO": "bar"},
+            language="TYPESCRIPT",
+        ).config_fingerprint()
+    )
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["lodash@^4.17", "axios"],
+            internet_access=True,
+            user_env={"FOO": "bar"},
+            language="TYPESCRIPT",
+        ).config_fingerprint()
+    )
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["lodash@^4.17"],
+            internet_access=False,
+            user_env={"FOO": "bar"},
+            language="TYPESCRIPT",
+        ).config_fingerprint()
+    )
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["lodash@^4.17"],
+            internet_access=True,
+            user_env={"FOO": "bar", "BAZ": "qux"},
+            language="TYPESCRIPT",
+        ).config_fingerprint()
+    )
+    # Language (Python vs TypeScript) fragments because the remote runtime
+    # is different.
+    assert (
+        base.config_fingerprint()
+        != _build(
+            packages=["lodash@^4.17"],
+            internet_access=True,
+            user_env={"FOO": "bar"},
+            language="PYTHON",
+        ).config_fingerprint()
+    )
+    # Secret-value-only change must NOT change the fingerprint.
+    assert (
+        base.config_fingerprint()
+        == _build(
+            packages=["lodash@^4.17"],
+            internet_access=True,
+            user_env={"FOO": "ROTATED"},
+            language="TYPESCRIPT",
+        ).config_fingerprint()
+    )

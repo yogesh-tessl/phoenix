@@ -40,6 +40,7 @@ from .types import (
     SandboxAdapter,
     SandboxBackend,
     compose_secret_values,
+    compute_config_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -112,6 +113,15 @@ class DaytonaSandboxBackend(SandboxBackend):
         self._language = language.upper() if language else _DEFAULT_LANGUAGE
         self._client: Optional[AsyncDaytona] = None
         self.secret_values = compose_secret_values(user_env, self._api_key)
+
+    def config_fingerprint(self) -> str:
+        return compute_config_fingerprint(
+            family="DAYTONA",
+            packages=self._packages,
+            internet_access_mode="deny" if self._network_block_all else "allow",
+            env_var_keys=list(self._user_env.keys()),
+            extra={"language": self._language},
+        )
 
     def _get_client(self) -> AsyncDaytona:
         if self._client is not None:
@@ -310,7 +320,56 @@ class DaytonaSandboxBackend(SandboxBackend):
             getattr(sandbox, "id", "<unknown>"),
             session_key,
         )
-        return sandbox
+
+        # Post-create dedup: another replica may have raced us. Re-list, pick
+        # the oldest survivor by ``id``, delete the rest. Sorting by ``id`` is
+        # deterministic across replicas, so both sides agree on the survivor
+        # without coordination.
+        return await self._dedupe_after_create(session_key, sandbox)
+
+    async def _dedupe_after_create(
+        self,
+        session_key: str,
+        just_created: AsyncSandbox,
+    ) -> AsyncSandbox:
+        """Resolve post-create races for ``session_key``.
+
+        If only one sandbox is tagged with the key, return the one we just
+        created. If multiple exist, keep the oldest by ``id`` and delete the
+        rest — including ``just_created`` if a competing replica created an
+        earlier one. Failures to delete a loser are logged and swallowed so a
+        transient API hiccup does not block the evaluator return; the
+        provider's TTL kwargs reap any duplicate this branch leaves behind.
+        """
+        client = self._get_client()
+        try:
+            candidates = await self._list_sandboxes_for_key(session_key)
+        except Exception as exc:
+            logger.warning(
+                "Daytona dedup: re-list failed for key=%r; keeping just-created sandbox_id=%s: %s",
+                session_key,
+                getattr(just_created, "id", "<unknown>"),
+                exc,
+            )
+            return just_created
+        if len(candidates) <= 1:
+            return just_created
+        candidates.sort(key=lambda sb: getattr(sb, "id", ""))
+        survivor = candidates[0]
+        just_created_id = getattr(just_created, "id", None)
+        if getattr(survivor, "id", None) == just_created_id:
+            survivor = just_created
+        for loser in candidates[1:]:
+            try:
+                await client.delete(loser)
+            except Exception as exc:
+                logger.warning(
+                    "Daytona dedup: failed to delete loser sandbox_id=%s for key=%r: %s",
+                    getattr(loser, "id", "<unknown>"),
+                    session_key,
+                    exc,
+                )
+        return survivor
 
     async def execute_in_session(
         self,

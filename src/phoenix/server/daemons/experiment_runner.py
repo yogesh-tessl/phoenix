@@ -88,7 +88,6 @@ from typing import (
     Callable,
     Hashable,
     Literal,
-    Optional,
     Protocol,
     Sequence,
     overload,
@@ -2160,17 +2159,15 @@ class ExperimentRunner(DaemonTask):
         *,
         decrypt: Callable[[bytes], bytes],
         tracer_factory: Callable[[], Tracer],
-        sandbox_session_manager: Optional["SandboxSessionManager"] = None,
+        sandbox_session_manager: "SandboxSessionManager",
     ) -> None:
         super().__init__()
         self._db = db
         self._decrypt = decrypt
         self._tracer_factory = tracer_factory
-        # Optional manager — when present, ``get_evaluators`` forwards it to
-        # every ``CodeEvaluatorRunner`` it constructs so dataset-eval sessions
-        # participate in invalidation/eviction coordination. None at app boot
-        # (legacy tests, alternate entry points) falls back to direct backend
-        # execution; sessions on those runs are untracked.
+        # Forwarded to every ``CodeEvaluatorRunner`` constructed by
+        # ``get_evaluators`` so dataset-eval sessions participate in the
+        # manager's invalidation/eviction coordination.
         self._sandbox_session_manager = sandbox_session_manager
         self._experiments: dict[ExperimentId, RunningExperiment] = {}
         self._seats = Semaphore(self.MAX_CONCURRENT)

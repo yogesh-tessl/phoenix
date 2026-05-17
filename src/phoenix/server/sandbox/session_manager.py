@@ -15,15 +15,22 @@ process). Application code obtains the instance via
 ``request.app.state.sandbox_session_manager`` (FastAPI) — never by
 constructing a new manager.
 
-Keying model: ``_tracked`` and ``_key_locks`` are keyed on the opaque
-``session_key`` string supplied by the caller. Backend wrappers are
-ephemeral (every request constructs a fresh ``SandboxBackend`` via
-``build_sandbox_backend``); wrapper identity is not load-bearing for
-session dispatch. Sessions are bound at the provider via
-``backend.find_or_create_session(session_key)``, which returns an opaque
-remote handle that the manager retains on ``_TrackedSession`` and passes
-back to ``backend.execute_in_session(handle, code, timeout=...)`` on
-each execute.
+Keying model: ``_tracked`` and ``_key_locks`` are keyed on an internal
+composite ``f"{session_key}#{backend.config_fingerprint()}"`` string.
+Callers pass their opaque logical ``session_key`` to ``acquire`` /
+``evict_for_session_key`` / ``schedule_eviction`` — composition with the
+backend's config fingerprint happens inside the manager. The fingerprint
+captures the provider family, package list, internet-access mode, and
+env-var key set, so a mid-iteration config change under a stable
+``session_key`` produces a fresh tracked entry (and a fresh remote
+session via ``find_or_create_session(composite_key)``) rather than
+silently dispatching against the old container. Backend wrappers
+remain ephemeral; wrapper identity is not load-bearing for session
+dispatch. Sessions are bound at the provider via
+``backend.find_or_create_session(composite_key)``, which returns an
+opaque remote handle that the manager retains on ``_TrackedSession``
+and passes back to ``backend.execute_in_session(handle, code,
+timeout=...)`` on each execute.
 """
 
 from __future__ import annotations
@@ -223,9 +230,10 @@ class SandboxSessionManager(DaemonTask):
     **Shutdown ordering.** ``stop()`` (overridden from ``DaemonTask``)
     drains in three phases under the inherited 10s ceiling:
     (1) await ``_pending_tasks`` (fire-and-forget evictions from
-    ``schedule_eviction``) under ``wait_for(eviction_grace_seconds)`` so
-    their underlying ``close_session`` calls complete rather than being
-    cancelled mid-flight; (2) snapshot every tracked session_key and
+    ``schedule_eviction``) via ``asyncio.wait(timeout=eviction_grace_seconds)``
+    so their underlying ``close_session`` calls complete; any tasks still
+    pending past the grace window are left running (not cancelled) and
+    logged as a warning; (2) snapshot every tracked session_key and
     drain via ``_evict_targets`` (which marks in-flight entries and
     waits up to ``eviction_grace_seconds`` for them to drain);
     (3) ``super().stop()`` cancels the sweeper. ``_pending_tasks`` is a
@@ -330,8 +338,16 @@ class SandboxSessionManager(DaemonTask):
             yield SandboxSession(backend, session_key, sentinel)
             return
 
+        # Compose a composite internal key so a mid-iteration config change
+        # under the same logical ``session_key`` produces a fresh entry. The
+        # logical key remains the caller-facing surface; the fingerprint is
+        # an internal disambiguator. The composite is also passed to
+        # ``backend.find_or_create_session`` so provider-side label / list-by-key
+        # convergence fragments along the same boundary.
+        composite_key = self._composite_key(session_key, backend)
+
         await self._ensure_state_lock()
-        key_lock = await self._get_or_create_key_lock(session_key)
+        key_lock = await self._get_or_create_key_lock(composite_key)
 
         async with key_lock:
             # Existence + capacity + insertion are atomic under
@@ -341,10 +357,10 @@ class SandboxSessionManager(DaemonTask):
             # dedup. Folding the existence check into the capacity-check +
             # insertion critical section makes ``_state_lock`` the inner
             # authority and closes the duplicate-start gap.
-            tracked, is_new = await self._get_or_reserve(backend, session_key)
+            tracked, is_new = await self._get_or_reserve(backend, session_key, composite_key)
             if is_new:
                 try:
-                    handle = await backend.find_or_create_session(session_key)
+                    handle = await backend.find_or_create_session(composite_key)
                 except BaseException as exc:
                     # find_or_create_session failed: drop the reservation so
                     # capacity accounting stays correct, then wake any
@@ -356,8 +372,8 @@ class SandboxSessionManager(DaemonTask):
                     tracked.start_error = exc
                     assert self._state_lock is not None
                     async with self._state_lock:
-                        self._tracked.pop(session_key, None)
-                        self._key_locks.pop(session_key, None)
+                        self._tracked.pop(composite_key, None)
+                        self._key_locks.pop(composite_key, None)
                     tracked.start_ready.set()
                     raise
                 tracked.handle = handle
@@ -380,16 +396,30 @@ class SandboxSessionManager(DaemonTask):
         try:
             yield SandboxSession(backend, session_key, session_handle)
         finally:
-            await self._release(session_key, key_lock)
+            await self._release(composite_key, key_lock)
 
     async def evict_for_session_key(self, session_key: str) -> None:
-        """Evict a single ``session_key`` entry.
+        """Evict every tracked entry for a logical ``session_key``.
 
-        If the entry has ``in_flight_count == 0`` it is closed immediately;
-        otherwise it is marked for eviction and closed on release. No-op
-        when the key is untracked.
+        Internally the manager keys ``_tracked`` on a composite of the logical
+        session key and the backend's config fingerprint, so a single logical
+        key can have multiple tracked entries when the same frontend session
+        has run against different backend configs (e.g. mid-iteration
+        provider / packages / env-vars switch). A logical eviction drains
+        every variant under the same ``session_key`` so callers using the
+        chat ``stopEvaluatorSession`` mutation see the documented "stop this
+        session" semantics regardless of config drift.
+
+        Entries with ``in_flight_count == 0`` are closed immediately; in-use
+        entries are marked for eviction and closed on release. No-op when no
+        entry matches the prefix.
         """
-        await self._evict_targets([session_key])
+        await self._ensure_state_lock()
+        assert self._state_lock is not None
+        prefix = f"{session_key}#"
+        async with self._state_lock:
+            targets = [k for k in self._tracked if k.startswith(prefix)]
+        await self._evict_targets(targets)
 
     async def evict_for_provider_family(self, family: str) -> None:
         """Evict every tracked session whose adapter family matches ``family``.
@@ -437,9 +467,11 @@ class SandboxSessionManager(DaemonTask):
         """Drain in-flight sessions, then cancel the sweeper.
 
         Ordering matters: ``_pending_tasks`` (fire-and-forget evictions
-        scheduled via ``schedule_eviction``) are awaited first so the
-        underlying ``backend.close_session`` calls complete instead of
-        being cancelled mid-flight; then every tracked ``session_key`` is
+        scheduled via ``schedule_eviction``) are awaited first via
+        ``asyncio.wait`` so the underlying ``backend.close_session`` calls
+        complete instead of being cancelled mid-flight; tasks still pending
+        past ``eviction_grace_seconds`` are left running (not cancelled)
+        and logged as a warning. Then every tracked ``session_key`` is
         drained via ``_evict_targets`` (which marks in-flight entries for
         eviction and waits up to ``eviction_grace_seconds`` for them to
         release); finally ``super().stop()`` cancels the sweeper task.
@@ -447,17 +479,15 @@ class SandboxSessionManager(DaemonTask):
         ``DaemonTask.stop``'s 10s ceiling.
         """
         # Drain pending evictions first — they may already be the call that
-        # would have popped a tracked entry. Use gather(return_exceptions=True)
-        # under wait_for so a single failing task neither cancels its
-        # siblings nor blocks shutdown.
+        # would have popped a tracked entry. ``asyncio.wait`` returns the
+        # (done, pending) split without cancelling the still-pending tasks,
+        # so a slow ``backend.close_session`` past the grace window keeps
+        # running to completion rather than being cancelled mid-flight.
+        # Provider-side TTLs reap any orphan that does outlive the daemon.
         pending = self._pending_tasks
         if pending:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=self._eviction_grace_seconds,
-                )
-            except asyncio.TimeoutError:
+            _, still_pending = await asyncio.wait(pending, timeout=self._eviction_grace_seconds)
+            if still_pending:
                 logger.warning(
                     "Pending sandbox eviction tasks did not drain within %.2fs",
                     self._eviction_grace_seconds,
@@ -493,14 +523,25 @@ class SandboxSessionManager(DaemonTask):
                 self._key_locks[session_key] = lock
             return lock
 
+    def _composite_key(self, session_key: str, backend: SandboxBackend) -> str:
+        """Compose the internal manager key from the caller's logical
+        ``session_key`` and the backend's config fingerprint.
+
+        Format: ``f"{session_key}#{fingerprint}"``. The ``#`` separator is
+        a stable lexical delimiter that ``evict_for_session_key`` relies on
+        for its prefix scan; callers never see this composition.
+        """
+        return f"{session_key}#{backend.config_fingerprint()}"
+
     async def _get_or_reserve(
         self,
         backend: SandboxBackend,
         session_key: str,
+        composite_key: str,
     ) -> tuple[_TrackedSession, bool]:
         """Atomically resolve an existing tracking slot or reserve a fresh one.
 
-        Under ``_state_lock``: (1) if ``_tracked[session_key]`` exists,
+        Under ``_state_lock``: (1) if ``_tracked[composite_key]`` exists,
         return ``(existing, False)`` without rechecking capacity — followers
         piggy-back on the leader's reservation. (2) Otherwise enforce
         ``max_sessions_per_provider`` (counted by adapter family) and insert
@@ -508,6 +549,13 @@ class SandboxSessionManager(DaemonTask):
         ``(new, True)``. The leader (``is_new=True``) is responsible for
         invoking ``backend.find_or_create_session`` outside this lock and
         flipping ``start_ready`` when it resolves.
+
+        ``session_key`` is the caller's logical key (recorded on
+        ``_TrackedSession`` for diagnostic logs); ``composite_key`` is the
+        internal manager key that includes the backend's config fingerprint
+        and is also what the leader passes to ``find_or_create_session`` /
+        ``close_session`` so provider-side label / list-by-key convergence
+        fragments along the same boundary.
 
         Folding the existence check into the same critical section as the
         capacity check + insertion is what makes popping ``_key_locks`` safe:
@@ -520,7 +568,7 @@ class SandboxSessionManager(DaemonTask):
         assert self._state_lock is not None
         family = _family_of(backend)
         async with self._state_lock:
-            existing = self._tracked.get(session_key)
+            existing = self._tracked.get(composite_key)
             if existing is not None:
                 # Refuse to admit new callers onto a session that another
                 # caller has explicitly invalidated. The entry is draining
@@ -536,10 +584,10 @@ class SandboxSessionManager(DaemonTask):
                 raise SessionLimitExceeded()
             tracked = _TrackedSession(
                 backend=backend,
-                session_key=session_key,
+                session_key=composite_key,
                 family=family,
             )
-            self._tracked[session_key] = tracked
+            self._tracked[composite_key] = tracked
             return tracked, True
 
     async def _release(self, session_key: str, key_lock: Lock) -> None:

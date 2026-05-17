@@ -2103,7 +2103,7 @@ input InlineCodeEvaluatorInput {
   outputConfigs: [AnnotationConfigInput!]!
   sandboxConfigId: ID = null
   description: String = null
-  sessionId: String = null
+  sessionId: String!
 }
 
 input InlineLLMEvaluatorInput {

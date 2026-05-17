@@ -29,6 +29,7 @@ from .types import (
     SandboxAdapter,
     SandboxBackend,
     compose_secret_values,
+    compute_config_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -83,6 +84,15 @@ class E2BSandboxBackend(SandboxBackend):
         self._allow_internet_access = allow_internet_access
         self._packages: list[str] = list(packages) if packages else []
         self.secret_values = compose_secret_values(user_env, self._api_key)
+
+    def config_fingerprint(self) -> str:
+        return compute_config_fingerprint(
+            family="E2B",
+            packages=self._packages,
+            internet_access_mode="allow" if self._allow_internet_access else "deny",
+            env_var_keys=list(self._user_env.keys()),
+            extra={"template": self._template} if self._template is not None else None,
+        )
 
     def _get_sandbox_cls(self) -> type[AsyncSandbox]:
         from e2b_code_interpreter.code_interpreter_async import AsyncSandbox

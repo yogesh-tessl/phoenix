@@ -31,7 +31,13 @@ def _categorical_config() -> CategoricalOutputConfig:
     )
 
 
-def _make_runner(backend: SandboxBackend, timeout: int = 1) -> CodeEvaluatorRunner:
+def _make_runner(
+    backend: SandboxBackend,
+    timeout: int = 1,
+    manager: SandboxSessionManager | None = None,
+) -> CodeEvaluatorRunner:
+    test_manager = manager if manager is not None else SandboxSessionManager()
+    test_manager.eviction_grace_seconds = 0.05
     return CodeEvaluatorRunner(
         name="test-runner",
         description=None,
@@ -40,6 +46,7 @@ def _make_runner(backend: SandboxBackend, timeout: int = 1) -> CodeEvaluatorRunn
         sandbox_backend=backend,
         language="PYTHON",
         timeout=timeout,
+        sandbox_session_manager=test_manager,
     )
 
 
@@ -47,12 +54,12 @@ _EMPTY_MAPPING = InputMapping(literal_mapping={}, path_mapping={})
 
 
 class _SlowBackend(SandboxBackend):
-    """Backend whose execute sleeps indefinitely; close_session is tracked.
+    """Backend whose execute_in_session sleeps indefinitely; close_session is tracked.
 
-    Implements the post-refactor ABC: ``find_or_create_session`` /
+    Implements the session-bound ABC: ``find_or_create_session`` /
     ``execute_in_session`` / ``close_session`` / ``execute`` / ``close``.
-    The runner's back-compat (no-manager) path routes through ``execute``,
-    so that's where the sleep lives.
+    The runner now drives all execution through the manager, which calls
+    ``execute_in_session`` — that's where the sleep lives.
     """
 
     # CodeEvaluatorRunner reads secret_values to seed SandboxSecretMasker.
@@ -62,6 +69,9 @@ class _SlowBackend(SandboxBackend):
     def __init__(self, close_raises: Exception | None = None) -> None:
         self.close_session_calls: list[str] = []
         self._close_raises = close_raises
+
+    def config_fingerprint(self) -> str:
+        return "slow"
 
     async def find_or_create_session(self, session_key: str) -> object:
         return object()
@@ -102,6 +112,9 @@ class _FastBackend(SandboxBackend):
     def __init__(self, result: ExecutionResult) -> None:
         self._result = result
         self.close_session_calls: list[str] = []
+
+    def config_fingerprint(self) -> str:
+        return "fast"
 
     async def find_or_create_session(self, session_key: str) -> object:
         return object()
@@ -155,7 +168,10 @@ class TestTimeoutWrapper:
             output_configs=[_categorical_config()],
         )
 
-        await asyncio.sleep(0)
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if backend.close_session_calls:
+                break
         assert len(backend.close_session_calls) == 1
 
     @pytest.mark.asyncio
@@ -172,11 +188,14 @@ class TestTimeoutWrapper:
                 name="test",
                 output_configs=[_categorical_config()],
             )
-            await asyncio.sleep(0)
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if any("close" in r.message.lower() for r in caplog.records):
+                    break
 
         assert len(results) == 1
         assert results[0]["error"] == "timeout"
-        assert any("close_session" in r.message for r in caplog.records)
+        assert any("close" in r.message.lower() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_fast_backend_result_passes_through_unchanged(self) -> None:
@@ -216,19 +235,20 @@ class TestTimeoutTeardownKeying:
     Guards two bugs:
 
     1. Wrong session key (resource leak). When ``session_key`` is overridden
-       (the frontend-generated UUID path), the fire-and-forget teardown must
-       use the override key — not ``self._name``. Otherwise the backend's
-       ``close_session`` looks up a non-existent key and leaks the sandbox.
+       (the frontend-generated UUID path), teardown must use the override key
+       — not ``self._name``. Otherwise the backend's ``close_session`` looks
+       up a non-existent key and leaks the sandbox.
 
-    2. Manager state desync (dead-session reuse). With a manager plumbed in,
-       teardown must route through ``schedule_eviction(session_key)`` so the
-       manager's ``_tracked`` entry is removed atomically with the
-       provider-side teardown.
+    2. Manager state desync (dead-session reuse). Teardown must route through
+       ``schedule_eviction(session_key)`` so the manager's ``_tracked`` entry
+       is removed atomically with the provider-side teardown.
     """
 
     @pytest.mark.asyncio
     async def test_override_session_key_used_for_teardown(self) -> None:
         backend = _SlowBackend()
+        manager = SandboxSessionManager()
+        manager.eviction_grace_seconds = 0.05
         override = "00000000-1111-2222-3333-444444444444"
         runner = CodeEvaluatorRunner(
             name="test-runner",
@@ -239,6 +259,7 @@ class TestTimeoutTeardownKeying:
             language="PYTHON",
             timeout=1,
             session_key=override,
+            sandbox_session_manager=manager,
         )
 
         await runner.evaluate(
@@ -247,10 +268,16 @@ class TestTimeoutTeardownKeying:
             name="test",
             output_configs=[_categorical_config()],
         )
-        await asyncio.sleep(0)
 
-        # close_session must be called with the override key — NOT self._name.
-        assert backend.close_session_calls == [override]
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if backend.close_session_calls:
+                break
+
+        # close_session must be called with a composite key derived from the
+        # override key — NOT self._name. The manager composes
+        # f"{session_key}#{backend.config_fingerprint()}" internally.
+        assert backend.close_session_calls == [f"{override}#slow"]
 
     @pytest.mark.asyncio
     async def test_manager_teardown_evicts_tracked_entry(self) -> None:
@@ -281,5 +308,5 @@ class TestTimeoutTeardownKeying:
             if backend.close_session_calls and not manager._tracked:
                 break
 
-        assert backend.close_session_calls == ["test-runner"]
+        assert backend.close_session_calls == ["test-runner#slow"]
         assert manager._tracked == {}

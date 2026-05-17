@@ -59,6 +59,7 @@ from .types import (
     VercelPythonConfig,
     VercelTypescriptConfig,
     compose_secret_values,
+    compute_config_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -201,6 +202,19 @@ class VercelSandboxBackend(SandboxBackend):
             self._token,
             self._project_id,
             self._team_id,
+        )
+
+    def config_fingerprint(self) -> str:
+        if self._internet_access is None:
+            ia_mode: Optional[str] = None
+        else:
+            ia_mode = "allow" if self._internet_access else "deny"
+        return compute_config_fingerprint(
+            family="VERCEL",
+            packages=self._packages,
+            internet_access_mode=ia_mode,
+            env_var_keys=list(self._user_env.keys()),
+            extra={"language": self._language},
         )
 
     def _lang_cfg(self) -> _LanguageConfig:

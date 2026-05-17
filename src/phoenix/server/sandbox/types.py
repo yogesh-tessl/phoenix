@@ -7,6 +7,8 @@ import unconditionally regardless of optional sandbox extras.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -496,6 +498,30 @@ class SandboxBackend(ABC):
         """Release all resources held by this backend."""
         ...
 
+    @abstractmethod
+    def config_fingerprint(self) -> str:
+        """Return a short, stable digest of the config fields that affect the
+        remote runtime.
+
+        Two backends with structurally-equal configs (same provider family,
+        same package list, same internet-access mode, same env-var key set)
+        must return the same fingerprint across replicas and across runs.
+        Changes to a secret's plaintext value that do NOT change the env-var
+        key set must NOT change the fingerprint — masking already handles
+        plaintext rotation; the fingerprint scopes session reuse and must
+        survive credential rotation.
+
+        Used by ``SandboxSessionManager`` to compose an internal composite
+        key (``f"{session_key}#{fingerprint}"``) so a mid-iteration config
+        change under a stable frontend ``session_key`` produces a fresh
+        session at both the Phoenix and provider layers.
+
+        Stateless adapters (``BaseNoSessionBackend``) return ``""`` — the
+        manager short-circuits stateless backends before composing, so the
+        value is unused.
+        """
+        ...
+
     def provider_session_id(self, session_key: str) -> str:
         """Map an opaque ``session_key`` to the identifier the provider sees.
 
@@ -539,6 +565,64 @@ class BaseNoSessionBackend(SandboxBackend):
 
     async def close_session(self, session_key: str) -> None:
         return None
+
+    def config_fingerprint(self) -> str:
+        # Stateless adapters never reach the manager's keying logic; the
+        # sentinel value is uniform and makes accidental composition obvious.
+        return ""
+
+
+def compute_config_fingerprint(
+    *,
+    family: str,
+    packages: Optional[Mapping[str, Any] | list[str] | tuple[str, ...]] = None,
+    internet_access_mode: Optional[str] = None,
+    env_var_keys: Optional[list[str] | tuple[str, ...] | set[str] | frozenset[str]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Compute a stable sha256-prefix fingerprint over a config subset.
+
+    Inputs are normalized into a canonical JSON document so two backends with
+    structurally-equal configs produce identical output:
+
+    - ``family``: provider family identifier (e.g. ``"MODAL"``).
+    - ``packages``: dependency specs; sorted so list order does not matter.
+    - ``internet_access_mode``: canonical mode token (e.g. ``"allow"``,
+      ``"deny"``, or ``None`` when unset).
+    - ``env_var_keys``: names of user-supplied env vars; sorted so insertion
+      order does not matter. **Values are intentionally excluded** so a
+      secret-plaintext rotation does not invalidate session reuse.
+    - ``extra``: adapter-specific extras whose change should fragment the
+      session (e.g. language for multi-language adapters); keys are sorted.
+
+    Returns a truncated lowercase hex digest (16 chars) suitable for
+    composing into a manager-internal key without bloating log lines.
+    """
+    packages_list: list[str]
+    if packages is None:
+        packages_list = []
+    elif isinstance(packages, Mapping):
+        # Defensive: callers may pass a dependencies dict directly.
+        raw_pkgs = packages.get("packages") or []
+        packages_list = sorted(str(p) for p in raw_pkgs)
+    else:
+        packages_list = sorted(str(p) for p in packages)
+
+    env_keys_list: list[str] = sorted(env_var_keys) if env_var_keys else []
+    extra_dict: dict[str, Any] = {}
+    if extra:
+        for k in sorted(extra):
+            extra_dict[k] = extra[k]
+
+    payload = {
+        "family": family,
+        "packages": packages_list,
+        "internet_access_mode": internet_access_mode,
+        "env_var_keys": env_keys_list,
+        "extra": extra_dict,
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 class SandboxAdapter(ABC):
